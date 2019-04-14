@@ -123,18 +123,19 @@
 //
 //------------------------------------------------------------------------------
 #include <algorithm>  // std::min
+#include <atomic>     // std::atomic_flag
 #include <cstdlib>    // std::abs
 #include <cstring>    // std::memset, std::memcpy
 #include <vector>     // std::vector
 #include "expr/sort_node.h"
 #include "expr/workframe.h"
 #include "frame/py_frame.h"
+#include "parallel/api.h"
 #include "python/args.h"
 #include "utils/alloc.h"
 #include "utils/array.h"
 #include "utils/assert.h"
 #include "utils/misc.h"
-#include "utils/parallel.h"
 #include "column.h"
 #include "datatable.h"
 #include "datatablemodule.h"
@@ -244,6 +245,83 @@ void swap(rmem& left, rmem& right) noexcept {
     std::swap(left.size, right.size);
   #endif
 }
+
+
+
+//------------------------------------------------------------------------------
+// Options
+//------------------------------------------------------------------------------
+
+static size_t sort_insert_method_threshold = 64;
+static size_t sort_thread_multiplier = 2;
+static size_t sort_max_chunk_length = 1 << 20;
+static uint8_t sort_max_radix_bits = 12;
+static uint8_t sort_over_radix_bits = 8;
+static int32_t sort_nthreads = 4;
+
+void sort_init_options() {
+  dt::register_option(
+    "sort.insert_method_threshold",
+    []{ return py::oint(sort_insert_method_threshold); },
+    [](py::oobj value) {
+      int64_t n = value.to_int64_strict();
+      if (n < 0) n = 0;
+      sort_insert_method_threshold = static_cast<size_t>(n);
+    },
+    "Largest n at which sorting will be performed using insert sort\n"
+    "method. This setting also governs the recursive parts of the\n"
+    "radix sort algorithm, when we need to sort smaller sub-parts of\n"
+    "the input.");
+
+  dt::register_option(
+    "sort.thread_multiplier",
+    []{ return py::oint(sort_thread_multiplier); },
+    [](py::oobj value) {
+      int64_t n = value.to_int64_strict();
+      if (n < 1) n = 1;
+      sort_thread_multiplier = static_cast<size_t>(n);
+    }, "");
+
+  dt::register_option(
+    "sort.max_chunk_length",
+    []{ return py::oint(sort_max_chunk_length); },
+    [](py::oobj value) {
+      int64_t n = value.to_int64_strict();
+      if (n < 1) n = 1;
+      sort_max_chunk_length = static_cast<size_t>(n);
+    }, "");
+
+  dt::register_option(
+    "sort.max_radix_bits",
+    []{ return py::oint(sort_max_radix_bits); },
+    [](py::oobj value) {
+      int64_t n = value.to_int64_strict();
+      if (n <= 0)
+        throw ValueError() << "Invalid sort.max_radix_bits parameter: " << n;
+      sort_max_radix_bits = static_cast<uint8_t>(n);
+    }, "");
+
+  dt::register_option(
+    "sort.over_radix_bits",
+    []{ return py::oint(sort_over_radix_bits); },
+    [](py::oobj value) {
+      int64_t n = value.to_int64_strict();
+      if (n <= 0)
+        throw ValueError() << "Invalid sort.over_radix_bits parameter: " << n;
+      sort_over_radix_bits = static_cast<uint8_t>(n);
+    }, "");
+
+  dt::register_option(
+    "sort.nthreads",
+    []{ return py::oint(sort_nthreads); },
+    [](py::oobj value) {
+      int32_t nth = value.to_int32_strict();
+      if (nth <= 0) nth += static_cast<int32_t>(dt::get_hardware_concurrency());
+      if (nth <= 0) nth = 1;
+      sort_over_radix_bits = static_cast<uint8_t>(nth);
+    }, "");
+}
+
 
 
 
@@ -399,7 +477,7 @@ class SortContext {
     use_order = false;
     descending = false;
 
-    nth = static_cast<size_t>(config::sort_nthreads);
+    nth = static_cast<size_t>(sort_nthreads);
     n = nrows;
     container_o.ensure_size(n * sizeof(int32_t));
     o = static_cast<int32_t*>(container_o.ptr);
@@ -422,10 +500,10 @@ class SortContext {
     groups = arr32_t(groupby.ngroups(), groupby.offsets_r(), false);
     gg.init(nullptr, 0, groupby.ngroups());
     if (!rowindex) {
-      #pragma omp parallel for schedule(static) num_threads(nth)
-      for (size_t i = 0; i < n; ++i) {
-        o[i] = static_cast<int32_t>(i);
-      }
+      dt::parallel_for_static(n,
+        [&](size_t i) {
+          o[i] = static_cast<int32_t>(i);
+        });
     }
   }
 
@@ -441,7 +519,7 @@ class SortContext {
     } else {
       _prepare_data_for_column<true>(col);
     }
-    if (n <= config::sort_insert_method_threshold) {
+    if (n <= sort_insert_method_threshold) {
       if (use_order) {
         kinsert_sort();
       } else {
@@ -578,19 +656,19 @@ class SortContext {
     uint8_t* xo = x.data<uint8_t>();
 
     if (use_order) {
-      #pragma omp parallel for schedule(static) num_threads(nth)
-      for (size_t j = 0; j < n; j++) {
-        xo[j] = ASC? static_cast<uint8_t>(xi[o[j]] + 191) >> 6
-                   : static_cast<uint8_t>(128 - xi[o[j]]) >> 6;
-      }
+      dt::parallel_for_static(n,
+        [=](size_t j) {
+          xo[j] = ASC? static_cast<uint8_t>(xi[o[j]] + 191) >> 6
+                     : static_cast<uint8_t>(128 - xi[o[j]]) >> 6;
+        });
     } else {
-      #pragma omp parallel for schedule(static) num_threads(nth)
-      for (size_t j = 0; j < n; j++) {
-        // xi[j]+191 should be computed as uint8_t; by default C++ upcasts it
-        // to int, which leads to wrong results after shift by 6.
-        xo[j] = ASC? static_cast<uint8_t>(xi[j] + 191) >> 6
-                   : static_cast<uint8_t>(128 - xi[j]) >> 6;
-      }
+      dt::parallel_for_static(n,
+        [=](size_t j) {
+          // xi[j]+191 should be computed as uint8_t; by default C++ upcasts it
+          // to int, which leads to wrong results after shift by 6.
+          xo[j] = ASC? static_cast<uint8_t>(xi[j] + 191) >> 6
+                     : static_cast<uint8_t>(128 - xi[j]) >> 6;
+        });
     }
   }
 
@@ -625,21 +703,21 @@ class SortContext {
     TO* xo = x.data<TO>();
 
     if (use_order) {
-      #pragma omp parallel for schedule(static) num_threads(nth)
-      for (size_t j = 0; j < n; ++j) {
-        TI t = xi[o[j]];
-        xo[j] = t == una? 0 :
-                ASC? static_cast<TO>(t - uedge + 1)
-                   : static_cast<TO>(uedge - t + 1);
-      }
+      dt::parallel_for_static(n,
+        [&](size_t j) {
+          TI t = xi[o[j]];
+          xo[j] = t == una? 0 :
+                  ASC? static_cast<TO>(t - uedge + 1)
+                     : static_cast<TO>(uedge - t + 1);
+        });
     } else {
-      #pragma omp parallel for schedule(static) num_threads(nth)
-      for (size_t j = 0; j < n; j++) {
-        TI t = xi[j];
-        xo[j] = t == una? 0 :
-                ASC? static_cast<TO>(t - uedge + 1)
-                   : static_cast<TO>(uedge - t + 1);
-      }
+      dt::parallel_for_static(n,
+        [&](size_t j) {
+          TI t = xi[j];
+          xo[j] = t == una? 0 :
+                  ASC? static_cast<TO>(t - uedge + 1)
+                     : static_cast<TO>(uedge - t + 1);
+        });
     }
   }
 
@@ -690,21 +768,21 @@ class SortContext {
     constexpr int SHIFT = sizeof(TO) * 8 - 1;
 
     if (use_order) {
-      #pragma omp parallel for schedule(static) num_threads(nth)
-      for (size_t j = 0; j < n; j++) {
-        TO t = xi[o[j]];
-        xo[j] = ((t & EXP) == EXP && (t & SIG) != 0) ? 0 :
-                ASC? t ^ (SBT | -(t>>SHIFT))
-                   : t ^ (~SBT & ((t>>SHIFT) - 1));
-      }
+      dt::parallel_for_static(n,
+        [&](size_t j) {
+          TO t = xi[o[j]];
+          xo[j] = ((t & EXP) == EXP && (t & SIG) != 0) ? 0 :
+                  ASC? t ^ (SBT | -(t>>SHIFT))
+                     : t ^ (~SBT & ((t>>SHIFT) - 1));
+        });
     } else {
-      #pragma omp parallel for schedule(static) num_threads(nth)
-      for (size_t j = 0; j < n; j++) {
-        TO t = xi[j];
-        xo[j] = ((t & EXP) == EXP && (t & SIG) != 0) ? 0 :
-                ASC? t ^ (SBT | -(t>>SHIFT))
-                   : t ^ (~SBT & ((t>>SHIFT) - 1));
-      }
+      dt::parallel_for_static(n,
+        [&](size_t j) {
+          TO t = xi[j];
+          xo[j] = ((t & EXP) == EXP && (t & SIG) != 0) ? 0 :
+                  ASC? t ^ (SBT | -(t>>SHIFT))
+                     : t ^ (~SBT & ((t>>SHIFT) - 1));
+        });
     }
   }
 
@@ -732,27 +810,36 @@ class SortContext {
     allocate_x();
     uint8_t* xo = x.data<uint8_t>();
 
-    T maxlen = 0;
-    #pragma omp parallel for schedule(static) num_threads(nth) \
-            reduction(max:maxlen)
-    for (size_t j = 0; j < n; ++j) {
-      int32_t k = use_order? o[j] : static_cast<int32_t>(j);
-      T offend = offs[k];
-      if (ISNA<T>(offend)) {
-        xo[j] = 0;    // NA string
-      } else {
-        T offstart = offs[k - 1] & ~GETNA<T>();
-        if (offend > offstart) {
-          xo[j] = ASC? strdata[offstart] + 2
-                     : 0xFE - strdata[offstart];
-          T len = offend - offstart;
-          if (len > maxlen) maxlen = len;
-        } else {
-          xo[j] = ASC? 1 : 0xFF;  // empty string
-        }
-      }
-    }
-    next_elemsize = (maxlen > 1);
+    // `flong` is a flag that checks whether there is any string with len>1.
+    std::atomic_flag flong = ATOMIC_FLAG_INIT;
+
+    dt::parallel_region(
+      /* nthreads= */ nth,
+      [&] {
+        bool len_gt_1 = false;
+        dt::parallel_for_static(
+          /* n_iterations= */ n,
+          /* chunk_size= */ 1024,
+          [&](size_t j) {
+            int32_t k = use_order? o[j] : static_cast<int32_t>(j);
+            T offend = offs[k];
+            if (ISNA<T>(offend)) {
+              xo[j] = 0;    // NA string
+            } else {
+              T offstart = offs[k - 1] & ~GETNA<T>();
+              if (offend > offstart) {
+                xo[j] = ASC? strdata[offstart] + 2
+                           : 0xFE - strdata[offstart];
+                T len = offend - offstart;
+                len_gt_1 |= (len > 1);
+              } else {
+                xo[j] = ASC? 1 : 0xFF;  // empty string
+              }
+            }
+          });
+        if (len_gt_1) flong.test_and_set();
+      });
+    next_elemsize = flong.test_and_set();
   }
 
 
@@ -778,13 +865,13 @@ class SortContext {
    *      nth, nchunks, chunklen, shift, nradixes
    */
   void determine_sorting_parameters() {
-    size_t nch = nth * config::sort_thread_multiplier;
+    size_t nch = nth * sort_thread_multiplier;
     chunklen = std::max((n - 1) / nch + 1,
-                        config::sort_max_chunk_length);
+                        sort_max_chunk_length);
     nchunks = (n - 1)/chunklen + 1;
 
-    uint8_t nradixbits = nsigbits < config::sort_max_radix_bits
-                         ? nsigbits : config::sort_over_radix_bits;
+    uint8_t nradixbits = nsigbits < sort_max_radix_bits
+                         ? nsigbits : sort_over_radix_bits;
     shift = nsigbits - nradixbits;
     nradixes = 1 << nradixbits;
 
@@ -826,15 +913,15 @@ class SortContext {
 
   template<typename T> void _histogram_gather() {
     T* tx = x.data<T>();
-    #pragma omp parallel for schedule(dynamic) num_threads(nth)
-    for (size_t i = 0; i < nchunks; ++i) {
-      size_t* cnts = histogram + (nradixes * i);
-      size_t j0 = i * chunklen;
-      size_t j1 = std::min(j0 + chunklen, n);
-      for (size_t j = j0; j < j1; ++j) {
-        cnts[tx[j] >> shift]++;
-      }
-    }
+    dt::parallel_for_static(nchunks, 1,
+      [&](size_t i) {
+        size_t* cnts = histogram + (nradixes * i);
+        size_t j0 = i * chunklen;
+        size_t j1 = std::min(j0 + chunklen, n);
+        for (size_t j = j0; j < j1; ++j) {
+          cnts[tx[j] >> shift]++;
+        }
+      });
   }
 
   void _histogram_cumulate() {
@@ -920,20 +1007,20 @@ class SortContext {
       xo = xx.data<TO>();
       mask = static_cast<TI>((1ULL << shift) - 1);
     }
-    #pragma omp parallel for schedule(dynamic) num_threads(nth)
-    for (size_t i = 0; i < nchunks; ++i) {
-      size_t j0 = i * chunklen;
-      size_t j1 = std::min(j0 + chunklen, n);
-      size_t* tcounts = histogram + (nradixes * i);
-      for (size_t j = j0; j < j1; ++j) {
-        size_t k = tcounts[xi[j] >> shift]++;
-        xassert(k < n);
-        next_o[k] = use_order? o[j] : static_cast<int32_t>(j);
-        if (OUT) {
-          xo[k] = static_cast<TO>(xi[j] & mask);
+    dt::parallel_for_static(nchunks,
+      [&](size_t i) {
+        size_t j0 = i * chunklen;
+        size_t j1 = std::min(j0 + chunklen, n);
+        size_t* tcounts = histogram + (nradixes * i);
+        for (size_t j = j0; j < j1; ++j) {
+          size_t k = tcounts[xi[j] >> shift]++;
+          xassert(k < n);
+          next_o[k] = use_order? o[j] : static_cast<int32_t>(j);
+          if (OUT) {
+            xo[k] = static_cast<TO>(xi[j] & mask);
+          }
         }
-      }
-    }
+      });
     xassert(histogram[nchunks * nradixes - 1] == n);
   }
 
@@ -943,34 +1030,40 @@ class SortContext {
     uint8_t* xo = xx.data<uint8_t>();
     const T sstart = static_cast<T>(strstart) + 1;
     const T* soffs = static_cast<const T*>(stroffs);
+    std::atomic_flag flong = ATOMIC_FLAG_INIT;
 
-    T maxlen = 0;
-    #pragma omp parallel for schedule(dynamic) num_threads(nth) \
-            reduction(max:maxlen)
-    for (size_t i = 0; i < nchunks; ++i) {
-      size_t j0 = i * chunklen;
-      size_t j1 = std::min(j0 + chunklen, n);
-      size_t* tcounts = histogram + (nradixes * i);
-      for (size_t j = j0; j < j1; ++j) {
-        size_t k = tcounts[xi[j]]++;
-        xassert(k < n);
-        int32_t w = use_order? o[j] : static_cast<int32_t>(j);
-        T offend = soffs[w];
-        T offstart = (soffs[w - 1] & ~GETNA<T>()) + sstart;
-        if (ISNA<T>(offend)) {
-          xo[k] = 0;
-        } else if (offend > offstart) {
-          xo[k] = ASC? strdata[offstart] + 2
-                     : 0xFE - strdata[offstart];
-          T len = offend - offstart;
-          if (len > maxlen) maxlen = len;
-        } else {
-          xo[k] = ASC? 1 : 0xFF;  // string is shorter than sstart
-        }
-        next_o[k] = w;
-      }
-    }
-    next_elemsize = (maxlen > 0);
+    dt::parallel_region(nth,
+      [&] {
+        bool tlong = false;
+        dt::parallel_for_static(
+          /* n_iterations= */ nchunks,
+          /* chunk_size= */ 1,
+          [&](size_t i) {
+            size_t j0 = i * chunklen;
+            size_t j1 = std::min(j0 + chunklen, n);
+            size_t* tcounts = histogram + (nradixes * i);
+            for (size_t j = j0; j < j1; ++j) {
+              size_t k = tcounts[xi[j]]++;
+              xassert(k < n);
+              int32_t w = use_order? o[j] : static_cast<int32_t>(j);
+              T offend = soffs[w];
+              T offstart = (soffs[w - 1] & ~GETNA<T>()) + sstart;
+              if (ISNA<T>(offend)) {
+                xo[k] = 0;
+              } else if (offend > offstart) {
+                xo[k] = ASC? strdata[offstart] + 2
+                           : 0xFE - strdata[offstart];
+                T len = offend - offstart;
+                tlong |= (len > 0);
+              } else {
+                xo[k] = ASC? 1 : 0xFF;  // string is shorter than sstart
+              }
+              next_o[k] = w;
+            }
+          });
+        if (tlong) flong.test_and_set();
+      });
+    next_elemsize = flong.test_and_set();
     xassert(histogram[nchunks * nradixes - 1] == n);
   }
 
@@ -1091,7 +1184,7 @@ class SortContext {
     constexpr size_t GROUPED = size_t(1) << 63;
     size_t size0 = 0;
     size_t nsmallgroups = 0;
-    size_t rrlarge = config::sort_insert_method_threshold;  // for now
+    size_t rrlarge = sort_insert_method_threshold;  // for now
     xassert(GROUPED > rrlarge);
 
     strstart = _strstart + 1;
@@ -1145,50 +1238,52 @@ class SortContext {
       TRACK(tmp, sizeof(tmp), "sort.tmp");
       // }
     }
-    #pragma omp parallel num_threads(nthreads)
-    {
-      int tnum = omp_get_thread_num();
-      int32_t* oo = tmp + tnum * static_cast<int32_t>(size0);
-      GroupGatherer tgg;
 
-      #pragma omp for schedule(dynamic)
-      for (size_t i = 0; i < _nradixes; ++i) {
-        size_t zn  = rrmap[i].size;
-        size_t off = rrmap[i].offset;
-        if (zn > rrlarge) {
-          rrmap[i].size = zn & ~GROUPED;
-        } else if (zn > 1) {
-          int32_t  tn = static_cast<int32_t>(zn);
-          rmem     tx { _x, off * elemsize, zn * elemsize };
-          int32_t* to = _o + off;
-          if (make_groups) {
-            tgg.init(ggdata0 + off, static_cast<int32_t>(off) + ggoff0);
-          }
-          if (strtype == 0) {
-            switch (elemsize) {
-              case 1: insert_sort_keys<>(tx.data<uint8_t>(), to, oo, tn, tgg); break;
-              case 2: insert_sort_keys<>(tx.data<uint16_t>(), to, oo, tn, tgg); break;
-              case 4: insert_sort_keys<>(tx.data<uint32_t>(), to, oo, tn, tgg); break;
-              case 8: insert_sort_keys<>(tx.data<uint64_t>(), to, oo, tn, tgg); break;
+    dt::parallel_region(nthreads,
+      [&] {
+        size_t tnum = dt::this_thread_index();
+        int32_t* oo = tmp + tnum * size0;
+        GroupGatherer tgg;
+
+        dt::parallel_for_dynamic(
+          /* n_iterations */ _nradixes,
+          [&](size_t i) {
+            size_t zn  = rrmap[i].size;
+            size_t off = rrmap[i].offset;
+            if (zn > rrlarge) {
+              rrmap[i].size = zn & ~GROUPED;
+            } else if (zn > 1) {
+              int32_t  tn = static_cast<int32_t>(zn);
+              rmem     tx { _x, off * elemsize, zn * elemsize };
+              int32_t* to = _o + off;
+              if (make_groups) {
+                tgg.init(ggdata0 + off, static_cast<int32_t>(off) + ggoff0);
+              }
+              if (strtype == 0) {
+                switch (elemsize) {
+                  case 1: insert_sort_keys<>(tx.data<uint8_t>(), to, oo, tn, tgg); break;
+                  case 2: insert_sort_keys<>(tx.data<uint16_t>(), to, oo, tn, tgg); break;
+                  case 4: insert_sort_keys<>(tx.data<uint32_t>(), to, oo, tn, tgg); break;
+                  case 8: insert_sort_keys<>(tx.data<uint64_t>(), to, oo, tn, tgg); break;
+                }
+              } else if (strtype == 1) {
+                const uint32_t* soffs = static_cast<const uint32_t*>(stroffs);
+                uint32_t ss = static_cast<uint32_t>(_strstart + 1);
+                insert_sort_keys_str(strdata, soffs, ss, to, oo, tn, tgg, descending);
+              } else {
+                const uint64_t* soffs = static_cast<const uint64_t*>(stroffs);
+                uint64_t ss = static_cast<uint64_t>(_strstart + 1);
+                insert_sort_keys_str(strdata, soffs, ss, to, oo, tn, tgg, descending);
+              }
+              if (make_groups) {
+                rrmap[i].size = static_cast<size_t>(tgg.size());
+              }
+            } else if (zn == 1 && make_groups) {
+              ggdata0[off] = static_cast<int32_t>(off) + ggoff0 + 1;
+              rrmap[i].size = 1;
             }
-          } else if (strtype == 1) {
-            const uint32_t* soffs = static_cast<const uint32_t*>(stroffs);
-            uint32_t ss = static_cast<uint32_t>(_strstart + 1);
-            insert_sort_keys_str(strdata, soffs, ss, to, oo, tn, tgg, descending);
-          } else {
-            const uint64_t* soffs = static_cast<const uint64_t*>(stroffs);
-            uint64_t ss = static_cast<uint64_t>(_strstart + 1);
-            insert_sort_keys_str(strdata, soffs, ss, to, oo, tn, tgg, descending);
-          }
-          if (make_groups) {
-            rrmap[i].size = static_cast<size_t>(tgg.size());
-          }
-        } else if (zn == 1 && make_groups) {
-          ggdata0[off] = static_cast<int32_t>(off) + ggoff0 + 1;
-          rrmap[i].size = 1;
-        }
-      }
-    }
+          });  // dt::parallel_for_dynamic
+      });  // dt::parallel_region
 
     // Consolidate groups into a single contiguous chunk
     if (make_groups) {

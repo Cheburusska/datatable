@@ -52,6 +52,24 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 - New function `dt.median()` can be used to compute median of a certain
   column or expression, either per group or for the entire Frame (#1530).
 
+- `Frame.__str__()` now returns a string containing the preview of the
+  frame's data. This allows datatable frames to be used with `print()`.
+
+- Added method `dt.options.describe()`, which will print the available
+  options together with their values and descriptions.
+
+- Added `dt.options.context(option=value)`, which can be used in a with-
+  statement to temporarily change the value of one or more options, and
+  then go back to their original values at the end of the with-block.
+
+- Added options `fread.log.escape_unicode` (controls treatment of unicode
+  characters in fread's verbose log); and `display.use_colors` (allows
+  to turn on/off colored output in the console).
+
+- `dt.options` now helps the user when he/she makes a typo: if an option
+  with a certain name does not exist, the error message will suggest the
+  correct spelling.
+
 
 ### Fixed
 
@@ -93,6 +111,8 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
   Adjust `dt.options.nthreads` in the child process(es) if different number
   of threads is required.
 
+- The interactive mode is no longer improperly turned on in IPython (#1789).
+
 
 ### Changed
 
@@ -108,6 +128,9 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
   performance. The property `Frame.internal` was removed, as it no longer
   represents anything. Certain internal properties of `Frame` can be accessed
   via functions declared in the `dt.internal.` module.
+
+- `datatable` no longer uses OpenMP for parallelism. Instead, we use our own
+  thread pool to perform multi-threaded computations (#1736).
 
 
 ### Deprecated
@@ -128,9 +151,10 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 - Thanks to everyone who helped make `datatable` more stable by discovering
   and reporting bugs that were fixed in this release:
 
-  [arno candel][] (#1619, #1730, #1738),
-  [antorsae][] (#1639),
-  [pasha stetsenko][] (#1672, #1694, #1695, #1697, #1703, #1705)
+  - [Arno Candel][] (#1619, #1730, #1738),
+  - [Antorsae][] (#1639),
+  - [NachiGithub][] (#1789),
+  - [Pasha Stetsenko][] (#1672, #1694, #1695, #1697, #1703, #1705)
 
 
 
@@ -1051,6 +1075,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 [megan kurka]: https://github.com/meganjkurka
 [michael frasco]: https://github.com/mfrasco
 [michal raška]: https://github.com/michal-raska
+[nachigithub]: https://github.com/NachiGithub
 [nishant kalonia]: https://github.com/nkalonia1
 [oleksiy kononenko]: https://github.com/oleksiyskononenko
 [olivier]: https://github.com/goldentom42

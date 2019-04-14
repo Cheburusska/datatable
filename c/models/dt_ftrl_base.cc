@@ -19,19 +19,16 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
 // IN THE SOFTWARE.
 //------------------------------------------------------------------------------
-#include "models/py_validator.h"
-
-// Error messages
-Error py::Validator::error_manager::error_not_positive(PyObject* src,
-                                                       const std::string& name
-) const {
-  return ValueError() << name << " should be positive: " << src;
-}
+#include "models/dt_ftrl_base.h"
 
 
-Error py::Validator::error_manager::error_negative(PyObject* src,
-                                                   const std::string& name
-) const {
-  return ValueError() << name << " should be greater than or equal to zero: "
-                      << src;
+namespace dt {
+
+
+/**
+ *  Destructor for the abstract `dt::FtrlBase` class.
+ */
+FtrlBase::~FtrlBase() {}
+
+
 }

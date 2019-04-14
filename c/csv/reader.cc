@@ -12,14 +12,53 @@
 #include "csv/reader.h"
 #include "csv/reader_arff.h"
 #include "csv/reader_fread.h"
+#include "parallel/api.h"
 #include "python/_all.h"
 #include "python/string.h"
 #include "utils/exceptions.h"
-#include "utils/parallel.h"
 #include "utils/misc.h"         // wallclock
 #include "datatable.h"
 #include "encodings.h"
 #include "options.h"
+
+
+//------------------------------------------------------------------------------
+// options
+//------------------------------------------------------------------------------
+
+static bool log_anonymize = false;
+static bool log_escape_unicode = false;
+
+void GenericReader::init_options() {
+  dt::register_option(
+    "fread.anonymize",
+    []{ return py::obool(log_anonymize); },
+    [](py::oobj value){ log_anonymize = value.to_bool_strict(); },
+    "[DEPRECATED] same as fread.log.anonymize");
+
+  dt::register_option(
+    "fread.log.anonymize",
+    []{ return py::obool(log_anonymize); },
+    [](py::oobj value){ log_anonymize = value.to_bool_strict(); },
+    "If True, any snippets of data being read that are printed in the\n"
+    "log will be first anonymized by converting all non-0 digits to 1,\n"
+    "all lowercase letters to a, all uppercase letters to A, and all\n"
+    "unicode characters to U.\n"
+    "This option is useful in production systems when reading sensitive\n"
+    "data that must not accidentally leak into log files or be printed\n"
+    "with the error messages.");
+
+  dt::register_option(
+    "fread.log.escape_unicode",
+    []{ return py::obool(log_escape_unicode); },
+    [](py::oobj value){ log_escape_unicode = value.to_bool_strict(); },
+    "If True, all unicode characters in the verbose log will be written\n"
+    "in hexadecimal notation. Use this option if your terminal cannot\n"
+    "print unicode, or if the output gets somehow corrupted because of\n"
+    "the unicode characters.");
+}
+
+
 
 
 //------------------------------------------------------------------------------
@@ -32,8 +71,6 @@ GenericReader::GenericReader(const py::robj& pyrdr)
   eof = nullptr;
   line = 0;
   cr_is_newline = 0;
-  printout_anonymize = config::fread_anonymize;
-  printout_escape_unicode = false;
   freader  = pyrdr;
   src_arg  = pyrdr.get_attr("src");
   file_arg = pyrdr.get_attr("file");
@@ -79,9 +116,7 @@ GenericReader::GenericReader(const GenericReader& g)
   fill             = g.fill;
   blank_is_na      = g.blank_is_na;
   number_is_na     = g.number_is_na;
-  override_column_types   = g.override_column_types;
-  printout_anonymize      = g.printout_anonymize;
-  printout_escape_unicode = g.printout_escape_unicode;
+  override_column_types = g.override_column_types;
   t_open_input = g.t_open_input;
   // Runtime parameters
   input_mbuf = g.input_mbuf;
@@ -100,21 +135,19 @@ void GenericReader::init_verbose() {
 }
 
 void GenericReader::init_nthreads() {
-  #ifdef DTNOOPENMP
-    nthreads = 1;
-    trace("Using 1 thread because datatable was built without OMP support");
-  #else
-    int32_t nth = freader.get_attr("nthreads").to_int32();
-    if (ISNA<int32_t>(nth)) {
-      nthreads = config::nthreads;
-      trace("Using default %d thread%s", nthreads, (nthreads==1? "" : "s"));
-    } else {
-      nthreads = config::normalize_nthreads(nth);
-      int maxth = config::normalize_nthreads(0);
-      trace("Using %d thread%s (requested=%d, max.available=%d)",
-            nthreads, (nthreads==1? "" : "s"), nth, maxth);
-    }
-  #endif
+  int32_t nth = freader.get_attr("nthreads").to_int32();
+  int maxth = static_cast<int>(dt::num_threads_in_pool());
+  if (ISNA<int32_t>(nth)) {
+    nthreads = maxth;
+    trace("Using default %d thread%s", nthreads, (nthreads==1? "" : "s"));
+  } else {
+    nthreads = nth;
+    if (nthreads > maxth) nthreads = maxth;
+    if (nthreads <= 0) nthreads += maxth;
+    if (nthreads <= 0) nthreads = 1;
+    trace("Using %d thread%s (requested=%d, max.available=%d)",
+          nthreads, (nthreads==1? "" : "s"), nth, maxth);
+  }
 }
 
 void GenericReader::init_fill() {
@@ -355,7 +388,8 @@ void GenericReader::_message(
     #pragma GCC diagnostic pop
   }
 
-  if (omp_get_thread_num() == 0) {
+  size_t ith = dt::this_thread_index();
+  if (ith + 1 <= 1) {
     try {
       Py_ssize_t len = static_cast<Py_ssize_t>(strlen(msg));
       PyObject* pymsg = PyUnicode_Decode(msg, len, "utf-8",
@@ -376,12 +410,10 @@ void GenericReader::_message(
 }
 
 void GenericReader::progress(double progress, int statuscode) {
-  xassert(omp_get_thread_num() == 0);
   freader.invoke("_progress", "(di)", progress, statuscode);
 }
 
 void GenericReader::emit_delayed_messages() {
-  xassert(omp_get_thread_num() == 0);
   if (delayed_message.size()) {
     trace("%s", delayed_message.c_str());
     delayed_message.clear();
@@ -452,9 +484,9 @@ const char* GenericReader::repr_binary(
 
     // Normal ASCII characters
     else if (c < 0x80) {
-      *out++ = (printout_anonymize && c >= '1' && c <= '9')? '1' :
-               (printout_anonymize && c >= 'a' && c <= 'z')? 'a' :
-               (printout_anonymize && c >= 'A' && c <= 'Z')? 'A' :
+      *out++ = (log_anonymize && c >= '1' && c <= '9')? '1' :
+               (log_anonymize && c >= 'a' && c <= 'z')? 'a' :
+               (log_anonymize && c >= 'A' && c <= 'Z')? 'A' :
                static_cast<char>(c);
     }
 
@@ -464,9 +496,9 @@ const char* GenericReader::repr_binary(
       size_t cp_bytes = (c < 0xE0)? 2 : (c < 0xF0)? 3 : 4;
       bool cp_valid = (ch + cp_bytes - 2 < endch) &&
                       is_valid_utf8(usrc, cp_bytes);
-      if (!cp_valid || printout_escape_unicode) {
+      if (!cp_valid || log_escape_unicode) {
         print_byte(c, out);
-      } else if (printout_anonymize) {
+      } else if (log_anonymize) {
         *out++ = 'U';
         ch += cp_bytes - 1;
       } else {

@@ -80,6 +80,7 @@ class Frame : public PyObject {
 
     // Frame display
     oobj m__repr__();
+    oobj m__str__();
     oobj _repr_html_(const PKArgs&);
     oobj _repr_pretty_(const PKArgs&);
     void view(const PKArgs&);
@@ -122,6 +123,9 @@ class Frame : public PyObject {
 
     // Exposed to users as `dt.frame_integrity_check(frame)` function
     void integrity_check();
+
+    // Called once during module start-up
+    static void init_names_options();
 
   private:
     static bool internal_construction;

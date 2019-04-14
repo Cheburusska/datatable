@@ -208,10 +208,33 @@ def test_internal_atomic():
         core.test_atomic()
 
 
+def test_internal_barrier():
+    from datatable.lib import core
+    if hasattr(core, "test_barrier"):
+        core.test_barrier(100)
+
+
 def test_internal_parallel_for_dynamic():
     from datatable.lib import core
     if hasattr(core, "test_parallel_for_dynamic"):
         core.test_parallel_for_dynamic(1000)
+
+
+def test_internal_parallel_for_ordered1():
+    from datatable.lib import core
+    if hasattr(core, "test_parallel_for_ordered"):
+        core.test_parallel_for_ordered(17234)
+
+
+def test_internal_parallel_for_ordered2():
+    from datatable.lib import core
+    if hasattr(core, "test_parallel_for_ordered"):
+        n0 = dt.options.nthreads
+        try:
+            dt.options.nthreads = 2
+            core.test_parallel_for_ordered(17234)
+        finally:
+            dt.options.nthreads = n0
 
 
 
@@ -246,6 +269,18 @@ def test_dt_view_keyed(patched_terminal, capsys):
             "\n"
             "[5 rows x 2 columns]\n"
             in out)
+
+
+def test_stringify(dt0):
+    assert ("     A   B   C     D   E   F  G    \n"
+            "--  --  --  --  ----  --  --  -----\n"
+            " 0   2   1   1   0.1       0  1    \n"
+            " 1   7   0   1   2         0  2    \n"
+            " 2   0   0   1  -4         0  hello\n"
+            " 3   0   1   1   4.4       0  world\n"
+            "\n"
+            "[4 rows x 7 columns]\n"
+            == str(dt0))
 
 
 def test_dt_getitem(dt0):
